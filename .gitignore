@@ -15,6 +15,7 @@
 *.dylib
 
 # Executables
+dnsrt
 *.exe
 *.out
 *.app
