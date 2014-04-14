@@ -7,6 +7,8 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 
 /* DNS flags and fields. */
 #define DNS_UDP_PORT            53
@@ -131,10 +133,26 @@ dns_filter_cmp(const uint8_t *domain)
 } /* dns_filter_cmp */
 
 /* What to do with matching records. */
-static int          match_nlsock = -1;
-static const char   *match_script = NULL;   /* Path of script to execute with the record. */
-static const char   *match_dev = NULL;      /* Add a route to A records via this device. */
-static const char   *match_via = NULL;      /* Add a route to A records via this host */
+static unsigned int match_nlseqno = 0;
+static int32_t match_ifindex = 0;           /* Add a route to A records via this device. */
+static struct in_addr match_route;   /* Add a route to A records via this address. */
+static const char *match_script = NULL;     /* Path of script to execute with the record. */
+
+#define NLMSG_TAIL(nmsg) ( (void *)((char *)(nmsg) + NLMSG_ALIGN((nmsg)->nlmsg_len)) )
+unsigned int
+rnl_addattr(struct nlmsghdr *nh, int maxlen, int type, const void *data, int alen)
+{
+    struct rtattr *attr;
+    int len = RTA_LENGTH(alen);
+    int nlen = NLMSG_ALIGN(nh->nlmsg_len) + RTA_SPACE(alen);
+    if (nlen > maxlen) return nlen;
+    attr = NLMSG_TAIL(nh);
+    attr->rta_type = type;
+    attr->rta_len = len;
+    if (data) memcpy(RTA_DATA(attr), data, alen);
+    nh->nlmsg_len = nlen;
+    return nlen;
+} /* rnl_addattr */
 
 static char *
 dns_decode_name(uint8_t *p)
@@ -323,10 +341,10 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
     uint32_t        ttl;
     /* Script args. */
     char            strttl[sizeof(uint32_t)*3 + 1];
-    char            strdata[512]; /* how big is big enough? */
+    char            data[512];  /* how big is big enough? */
     const char *    argv[argv_null + 1];
     
-    /* Get the DNS name in label-encoded format. */
+    /* Decompress the DNS name. */
     if (!(p = dns_decomp_name(hdr, record, name, len))) return NULL;
     if ((p + 10) >= end) return NULL; /* record too short */
         
@@ -342,13 +360,15 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
     ttl |= *p++;
     rlength = *p++ << 8;
     rlength |= *p++;
+    /* Update the end pointer for this record. */
     if ((p + rlength) >= end) return NULL; /* RDATA too long. */
+    end = p + rlength;
     
     /* If there were any filters specified, only evaluate matching domains. */
-    if (dns_filter_cmp(name)) return (p + rlength);
+    if (dns_filter_cmp(name)) return end;
     
     /* Ignore non-internet class records. */
-    if (rclass != DNS_CLASS_IN) return (p + rlength);
+    if (rclass != DNS_CLASS_IN) return end;
     
     /* Prepare the script arguments. */
     memset(argv, 0, sizeof(argv));
@@ -358,19 +378,19 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
     argv[argv_ttl] = strttl;
     argv[argv_class] = "IN";
     
-    /* TODO: Handle the record data. */
+    /* Parse the record data. */
     switch (type) {
     case DNS_TYPE_A:{
         if (rlength < sizeof(struct in_addr)) return NULL; /* malformed A record. */
         argv[argv_type] = "A";
-        argv[argv_data] = inet_ntop(AF_INET, p, strdata, sizeof(strdata));
+        argv[argv_data] = inet_ntop(AF_INET, p, data, sizeof(data));
         if (!argv[argv_data]) return NULL; /* malformed A record. */
         break;
     }
     case DNS_TYPE_AAAA:{
         if (rlength < sizeof(struct in6_addr)) return NULL; /* malformed AAAA record. */
         argv[argv_type] = "AAAA";
-        argv[argv_data] = inet_ntop(AF_INET6, p, strdata, sizeof(strdata));
+        argv[argv_data] = inet_ntop(AF_INET6, p, data, sizeof(data));
         if (!argv[argv_data]) return NULL; /* malformed AAAA record. */
         break;
     }
@@ -385,7 +405,7 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
     case DNS_TYPE_TXT:
     case DNS_TYPE_SRV:
     default:
-        return (p + rlength);
+        return end;
     } /* switch */
     
     /* Fork and execute the script. Do not wait for the child. */
@@ -399,9 +419,59 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
             /* We are the parent, wait for the child to complete. */
             /* Or do we continue? and let the child reap itself when done? */
             wait(NULL);
+            /* TODO: Don't update the routes if the script returns an erorr. */
         }
     }
-    return (p + rlength);
+    /* If a router and/or interface was specified, update the routing table */
+    if (type != DNS_TYPE_A) return end;
+    if ((match_route.s_addr != htonl(INADDR_ANY)) || match_ifindex) {
+        int sock;
+        /*
+         * TODO: We need to keep a list of records and manage the TTL so that
+         * we're not filling the kernel's table with zombie routes. It would
+         * be nice if we could set the rta_expires timer from userspace.
+         */
+        struct sockaddr_nl  sa;
+        struct nlmsghdr     *nh = (struct nlmsghdr *)data;
+        struct rtmsg        *rtm = NLMSG_DATA(nh);
+        memset(nh, 0, NLMSG_SPACE(sizeof(struct rtmsg)));
+        nh->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+        nh->nlmsg_type = RTM_NEWROUTE;
+        nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK;
+        nh->nlmsg_pid = 0;
+        nh->nlmsg_seq = ++match_nlseqno;
+        rtm->rtm_family = AF_INET;
+        rtm->rtm_dst_len = 32;
+        rtm->rtm_protocol = RTPROT_REDIRECT; /* TODO: Will any of these trigger the expires timer? */
+        rtm->rtm_type = RTN_UNICAST; 
+        rtm->rtm_scope = RT_SCOPE_UNIVERSE;
+        rtm->rtm_table = RT_TABLE_UNSPEC;
+        rnl_addattr(nh, sizeof(data), RTA_DST, p, sizeof(struct in_addr));
+        if (match_route.s_addr != htonl(INADDR_ANY)) {
+            rnl_addattr(nh, sizeof(data), RTA_GATEWAY, &match_route, sizeof(struct in_addr));
+        }
+        if (match_ifindex > 0) {
+            rnl_addattr(nh, sizeof(data), RTA_OIF, &match_ifindex, sizeof(int32_t));
+        }
+        
+        /* Send RTM_NEWROUTE to the kernel. */
+        memset(&sa, 0, sizeof(sa));
+        sa.nl_family = AF_NETLINK;
+        sock = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
+        if (sock < 0) return end;
+        if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+            fprintf(stderr, "bind failed on netlink socket (%s)\n", strerror(errno));
+            close(sock);
+            return end;
+        }
+        sa.nl_pid = 0; /* sending to the kernel. */
+        len = sendto(sock, nh, nh->nlmsg_len, 0, (struct sockaddr *)&sa, sizeof(sa));
+        if (len != nh->nlmsg_len) {
+            fprintf(stderr, "RTM_NEWROUTE failed (%s)\n", strerror(errno));
+        }
+        close(sock);
+    }
+    return end;
 } /* dns_input_record */
 
 /*FUNCTION:------------------------------------------------------
@@ -457,14 +527,14 @@ usage(int argc, char **argv)
 int
 main(int argc, char **argv)
 {
-    static const char   *shortopts = "d:s:o:vh";
+    static const char   *shortopts = "d:r:s:vh";
     static struct option longopts[] = {
         /* Command-line only options. */
         {"dev",     required_argument,  0, 'd'},
-        {"via",     required_argument,  0, 'v'},
+        {"route",   required_argument,  0, 'r'},
         {"script",  required_argument,  0, 's'},
         {"help",    no_argument,        0, 'h'},
-        {"version", no_argument,        0, 1},
+        {"version", no_argument,        0, 'v'},
         {0, 0, 0, 0}
     };
     int         c;
@@ -480,10 +550,23 @@ main(int argc, char **argv)
         case 's':
             match_script = optarg;
             continue;
+        case 'r':
+            /* Parse the IPv4 router address to use for matching records. */
+            if (inet_pton(AF_INET, optarg, &match_route) <= 0) {
+                fprintf(stderr, "Failed to parse IPv4 router address: %s\n", optarg);
+                break;
+            }
+            if (match_route.s_addr == htonl(INADDR_ANY)) {
+                fprintf(stderr, "Invalid IPv4 router address: %s\n", optarg);
+                break;
+            }
+            continue;
         case 'd':
-        case 'v':
-            /* TODO: */
-            break;
+            if (!(match_ifindex = if_nametoindex(optarg))) {
+                fprintf(stderr, "Unknown interface: %s\n", optarg);
+                break;
+            }
+            continue;
         default:
         case '?':
             break;
