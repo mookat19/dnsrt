@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <errno.h>
 #include <getopt.h>
+#include <time.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -91,28 +93,390 @@ struct dns_hdr {
     uint16_t    arcount;
 };
 
+/* Returns the length of a label-encoded domain name. */
+static int
+dns_namelen(const uint8_t *p)
+{
+    const uint8_t *start;
+    for (start = p; p < (start + DNS_MAX_QNAME); p += *p + 1) if (!*p) break;
+    if (*p) return -1; /* domain too long */
+    return (p - start + 1);
+} /* dns_namelen */
+
+/* Decodes a DNS name into dot-delimited format (in place). */
+static char *
+dns_decode_name(uint8_t *p)
+{
+    uint8_t *end = (p + DNS_MAX_QNAME);
+    uint8_t *start = p;
+    if (!*p) return strcpy(p, "."); /* special case. */
+    do {
+        int len = *p;
+        if (len & 0xc0) return NULL; /* Should not encounter compression. */
+        if ((p + len) > (end - 2)) return NULL; /* too long. */
+        memmove(p, p+1, len);
+        p += len;
+        *p++ = '.';
+    } while (*p);
+    return start;
+} /* dns_decode_name */
+
+/*
+ * Encodes a dot-delimited string into DNS label-encoded format.
+ * Converstion happens in-place. This will grow the string by one
+ * character if it was not properly terminated with a trailing dot.
+ */
+static uint8_t *
+dns_encode_name(char *start)
+{
+    uint8_t *name = start;
+    uint8_t *end = strchr(name, '\0');
+    if ((name != end) && (*(end-1) != '.')) end++;
+    memmove(name+1, name, (end - name));
+    do {
+        uint8_t *p = memchr(name+1, '.', (end-name-1));
+        if (!p) p = end;
+        *name = (p - name - 1);
+        name = p;
+    } while (name < end);
+    *end = 0;
+    return start;
+} /* dns_encode_name */
+
+/* DNS cache of matching records. */
+/*  Stored in a double-linked list.
+ *  Sorted by increasing TTL.
+ *  TTL is in seconds relative to the CLOCK_MONOTONIC timer.
+ */
+struct dns_cache {
+    struct dns_cache *next;
+    struct dns_cache *prev;
+    uint8_t         nlen;
+    uint8_t         name[DNS_MAX_QNAME];
+    unsigned long   ttl;
+    uint16_t        type;
+    uint16_t        rclass;
+    uint16_t        priority;   /* SRV/MX records only */
+    uint16_t        weight;     /* SRV records only */
+    uint16_t        port;       /* SRV records only */
+    uint16_t        length;
+    uint8_t         target[DNS_MAX_QNAME];
+};
+static struct dns_cache *dns_cache_head;
+static struct dns_cache *dns_cache_tail;
+
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_cache_update
+ *  DESCRIPTION
+ *      Updates the TTL and/or inserts an entry into the DNS cache.
+ *  PARAMETERS
+ *      cache           ; DNS cache entry.
+ *      ttl             ; TTL from now.
+ *  RETURNS
+ *      void            ;
+ *---------------------------------------------------------------
+ */
+static void
+dns_cache_update(struct dns_cache *cache, uint32_t ttl)
+{
+    struct timespec     now;
+    struct dns_cache    *p;
+
+    /* If this entry is already in the cache, unlink it. */
+    if (cache->ttl) {
+        if (cache->next) cache->next->prev = cache->prev;
+        else dns_cache_tail = cache->prev;
+        if (cache->prev) cache->prev->next = cache->next;
+        else dns_cache_head = cache->next;
+    }
+    cache->next = NULL;
+    cache->prev = NULL;
+    /* Update the TTL, and insert back into the cache. */
+    if (!ttl) return;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    cache->ttl = now.tv_sec + ttl;
+    /* Updated records are more likely to have higher TTL values, so search from the tail. */
+    for (p = dns_cache_tail; p; p = p->prev) {
+        if (p->ttl > cache->ttl) continue;
+        cache->prev = p;
+        cache->next = p->next;
+        if (cache->next) cache->next->prev = cache;
+        else dns_cache_tail = cache;
+        if (cache->prev) cache->prev->next = cache;
+        else dns_cache_head = cache;
+        return;
+    } /* for */
+    cache->prev = NULL;
+    cache->next = dns_cache_head;
+    if (cache->next) cache->next->prev = cache;
+    dns_cache_head = cache;
+} /* dns_cache_update */
+
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_cache_lookup
+ *  DESCRIPTION
+ *      Searches for an entry in the DNS cache with the desired
+ *      name and type.
+ *  PARAMETERS
+ *      type                ; Record type.
+ *      name                ; Record name.
+ *  RETURNS
+ *      struct dns_cache *  ;
+ *---------------------------------------------------------------
+ */
+static struct dns_cache *
+dns_cache_lookup(uint16_t type, const uint8_t *name)
+{
+    struct dns_cache *p;
+    int nlen = dns_namelen(name);
+    for (p = dns_cache_head; p; p = p->next) {
+        if (p->type != type) continue;
+        if (p->nlen != nlen) continue;
+        if (memcmp(p->name, name, nlen)) continue;
+        return p;
+    } /* for */
+    return NULL;
+} /* dns_cache_lookup */
+
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_cache_script
+ *  DESCRIPTION
+ *      Invokes the user script for the cache entry.
+ *  PARAMETERS
+ *      cache           ; Cache entry.
+ *      ttl             ; TTL (in seconds from now)
+ *      script          ; record script to execute.
+ *  RETURNS
+ *      void            ;
+ *---------------------------------------------------------------
+ */
+static void
+dns_cache_script(struct dns_cache *cache, uint32_t ttl, const char *script)
+{
+    enum {
+        argv_script = 0,
+        argv_name,
+        argv_ttl,
+        argv_class,
+        argv_type,
+        argv_data,
+        argv_data_1,
+        argv_data_2,
+        argv_data_3,
+        argv_data_4,
+        argv_null,
+        argv_max,
+    };
+    int         offset = 0;
+    char        name[DNS_MAX_STRING];
+    char        data[512];  /* how big is big enough? */
+    const char *argv[argv_max];
+
+/* Some helper macros. */
+#define cache_argv_fmt(_v_, _idx_, _fmt_, _val_) \
+do {int len = snprintf(data+offset, sizeof(data)-offset, _fmt_, _val_); \
+    if ((len < 0) || ((len + offset) >= sizeof(data))) return;          \
+    (_v_)[_idx_] = &data[offset]; offset += len+1; \
+} while(0)
+
+#define cache_argv_name(_v_, _idx_, _target_)   \
+do {int len = dns_namelen(_target_);            \
+    if ((len + offset) >= sizeof(data)) return; \
+    (_v_)[_idx_] = dns_decode_name(memcpy(&data[offset], (_target_), len)); \
+    if (!(_v_)[_idx_]) return;                  \
+    offset += len+1;                            \
+} while(0)
+
+#define cache_argv_const(_v_, _idx_, _str_) (_v_)[_idx_] = (_str_)
+
+    /* Prepare the script arguments. */
+    memset(argv, 0, sizeof(argv));
+    cache_argv_const(argv, argv_script, script);
+    cache_argv_name(argv, argv_name, cache->name);
+    cache_argv_fmt(argv, argv_ttl, "%u", ttl);
+    cache_argv_const(argv, argv_class, "IN");
+
+    switch (cache->type) {
+    case DNS_TYPE_A:
+        cache_argv_const(argv, argv_type, "A");
+        argv[argv_data] = inet_ntop(AF_INET, cache->target, &data[offset], sizeof(data)-offset);
+        if (!argv[argv_data]) return; /* malformed. */
+        break;
+    case DNS_TYPE_AAAA:
+        cache_argv_const(argv, argv_type, "AAAA");
+        argv[argv_data] = inet_ntop(AF_INET6, cache->target, &data[offset], sizeof(data)-offset);
+        if (!argv[argv_data]) return; /* malformed. */
+        break;
+    case DNS_TYPE_CNAME:
+        cache_argv_const(argv, argv_type, "CNAME");
+        cache_argv_name(argv, argv_data, cache->target);
+        break;
+    case DNS_TYPE_PTR:
+        cache_argv_const(argv, argv_type, "PTR");
+        cache_argv_name(argv, argv_data, cache->target);
+        break;
+    case DNS_TYPE_MX:
+        cache_argv_const(argv, argv_type, "MX");
+        cache_argv_fmt(argv, argv_data, "%u", cache->priority);
+        cache_argv_name(argv, argv_data+1, cache->target);
+        break;
+    case DNS_TYPE_SRV:
+        cache_argv_const(argv, argv_type, "SRV");
+        cache_argv_fmt(argv, argv_data, "%u", cache->priority);
+        cache_argv_fmt(argv, argv_data+1, "%u", cache->weight);
+        cache_argv_fmt(argv, argv_data+2, "%u", cache->port);
+        cache_argv_name(argv, argv_data+3, cache->target);
+        break;
+    default:
+        /* Unsupported record type. */
+        cache_argv_fmt(argv, argv_type, "%u", cache->type);
+        break;
+    } /* switch */
+
+    /* Fork and execute the script. Do not wait for the child. */
+    if (fork() == 0) {
+        /* We are the child - execute the script. */
+        execv(argv[argv_script], argv);
+        /* We should not get here, bad things have happened if we do. */
+        abort();
+    } else {
+        /* We are the parent, wait for the child to complete. */
+        /* Or do we continue? and let the child reap itself when done? */
+        wait(NULL);
+        /* TODO: Don't update the routes if the script returns an erorr. */
+    }
+} /* dns_cache_script */
+
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_cache_dump
+ *  DESCRIPTION
+ *      Dumps the DNS cache.
+ *  PARAMETERS
+ *      void            ;
+ *  RETURNS
+ *      void            ;
+ *---------------------------------------------------------------
+ */
+static void
+dns_cache_dump(void)
+{
+    struct dns_cache    *p;
+    struct timespec     now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    for (p = dns_cache_head; p; p = p->next) {
+        if (now.tv_sec <= p->ttl)
+            dns_cache_script(p, p->ttl - now.tv_sec, "/bin/echo");
+    } /* for */
+} /* dns_cache_dump */
+
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_cache_timeout
+ *  DESCRIPTION
+ *      Purges expired records from the DNS cache and calculates
+ *      the next timeout.
+ *  PARAMETERS
+ *      tv              ; Timeout until the next cache purge.
+ *  RETURNS
+ *      void            ;
+ *---------------------------------------------------------------
+ */
+static void
+dns_cache_timeout(struct timeval *tv, const char *script)
+{
+    struct timespec     now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    while (dns_cache_head) {
+        struct dns_cache *p = dns_cache_head;
+        if (dns_cache_head->ttl > now.tv_sec) break;
+        if (script) dns_cache_script(p, 0, script);
+        if (p->next) p->next->prev = NULL;
+        dns_cache_head = p->next;
+        free(p);
+    } /* while */
+    tv->tv_usec = 0;
+    tv->tv_sec = (dns_cache_head) ? (dns_cache_head->ttl - now.tv_sec) : 60;
+} /* dns_cache_timeout */
+
 /* List of domains to filter (whitelist), sorted by decreasing length. */
 struct filter_list {
     struct filter_list *next;
     int                 length;
+    /* TODO: We could get really fancy and use a regex_t */
     uint8_t             domain[DNS_MAX_QNAME];
 };
 static struct filter_list *filters;
 
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_filter_add
+ *  DESCRIPTION
+ *      Adds a new domain to the filter list.
+ *  PARAMETERS
+ *      name            ; Domain name (dot-delimited).
+ *  RETURNS
+ *      void            ;
+ *---------------------------------------------------------------
+ */
+static void
+dns_filter_add(const char *name)
+{
+    struct filter_list *f;
+    struct filter_list *p;
+
+    /* Sanity */
+    if (strlen(name) > DNS_MAX_STRING) {
+        fprintf(stderr, "Filter domain too long: %s\n", name);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Allocate memory for the new filter list entry. */
+    if (!(f = malloc(sizeof(struct filter_list)))) {
+        fprintf(stderr, "Out of memory!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Encode the filter domain, and insert it into the list, ordered by descending length. */
+    dns_encode_name(strcpy(f->domain, name));
+    if ((f->length = dns_namelen(f->domain)) < 0) {
+        fprintf(stderr, "Malformed DNS domain: %s\n", name);
+        exit(EXIT_FAILURE);
+    }
+    /* Insert this domain into the filter list, and keep it sorted by length */
+    if (!filters || (filters->length < f->length)) {
+        f->next = filters;
+        filters = f;
+        return;
+    }
+    for (p = filters; p->next; p = p->next) if (p->next->length <= f->length) break;
+    f->next = p->next;
+    p->next = f;
+} /* dns_filter_add */
+
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_filter_cmp
+ *  DESCRIPTION
+ *      Compares the name against the list of domain filters.
+ *  PARAMETERS
+ *      domain          ; name.
+ *  RETURNS
+ *      int             ; 0 on a match, non-zero if no match.
+ *---------------------------------------------------------------
+ */
 static int
 dns_filter_cmp(const uint8_t *domain)
 {
     struct filter_list  *f = filters;
     const uint8_t       *p;
-    int                 length;
+    int                 length = dns_namelen(domain);
     
     /* Always true if no filters provided. */
     if (!filters) return 0;
-    
-    /* Compute the length of the target domain. */
-    for (p = domain; p < (domain + DNS_MAX_QNAME); p += *p + 1) if (!*p) break;
-    if (*p) return -1; /* domain too long */
-    length = (p - domain + 1);
     
     /* Iterate through the labels until we find that matches in the filter list. */
     for (p = domain; *p;) {
@@ -134,10 +498,11 @@ dns_filter_cmp(const uint8_t *domain)
 
 /* What to do with matching records. */
 static unsigned int match_nlseqno = 0;
-static int32_t match_ifindex = 0;           /* Add a route to A records via this device. */
-static struct in_addr match_route;   /* Add a route to A records via this address. */
-static const char *match_script = NULL;     /* Path of script to execute with the record. */
+static int32_t match_ifindex = 0;       /* Add a route to A records via this device. */
+static struct in_addr match_route;      /* Add a route to A records via this address. */
+static const char *match_script = NULL; /* Path of script to execute with the record. */
 
+/* Helper function to append netlink route attributes. */
 #define NLMSG_TAIL(nmsg) ( (void *)((char *)(nmsg) + NLMSG_ALIGN((nmsg)->nlmsg_len)) )
 unsigned int
 rnl_addattr(struct nlmsghdr *nh, int maxlen, int type, const void *data, int alen)
@@ -154,57 +519,21 @@ rnl_addattr(struct nlmsghdr *nh, int maxlen, int type, const void *data, int ale
     return nlen;
 } /* rnl_addattr */
 
-static char *
-dns_decode_name(uint8_t *p)
-{
-    uint8_t *end = (p + DNS_MAX_QNAME);
-    uint8_t *start = p;
-    if (!*p) return strcpy(p, "."); /* special case. */
-    do {
-        int len = *p;
-        if (len & 0xc0) return NULL; /* Should not encounter compression. */
-        if ((p + len) > (end - 2)) return NULL; /* too long. */
-        memmove(p, p+1, len);
-        p += len;
-        *p++ = '.';
-    } while (*p);
-    return start;
-} /* dns_decode_name */
-
-static int
-dns_encode_name(const char *name, uint8_t *buf)
-{
-    int len;
-    
-    /* Sanity */
-    if (!name) return -1;
-    if (*name == '\0') {
-        *buf = 0;
-        return 1;
-    }
-    
-    /* Split the name into labels */
-    for (len = 0;;) {
-        /* Get the length of the next token. */
-        int i = strcspn(name, ".");
-        if (i > DNS_MAX_LABEL) return -1;
-        if ((len + i) > (DNS_MAX_QNAME - 2)) return -1; /* too long */
-        /* Write this label into the buffer. */
-        buf[len++] = i;
-        memcpy(&buf[len], name, i);
-        len += i;
-        name += i;
-        /* Check for the end of the string. */
-        if (*name == '.') name++;
-        if (*name == '\0') break;
-    }
-
-    /* Done. */
-    buf[len++] = 0;
-    return len;
-} /* dns_encode_name */
-
-/* Simple helper to safely deference pointers. */
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_name_ptr
+ *  DESCRIPTION
+ *      Helper to safely dereference a pointer within a compressed
+ *      name. This will check that the pointer points to a valid
+ *      DNS label, and that the pointer falls within the DNS
+ *      packet.
+ *  PARAMETERS
+ *      hdr             ; DNS Header structure.
+ *      p               ; DNS pointer label.
+ *  RETURNS
+ *      const uint8_t * ; The target DNS label.
+ *---------------------------------------------------------------
+ */
 static const uint8_t *
 dns_name_ptr(const struct dns_hdr *hdr, const uint8_t *p)
 {
@@ -289,24 +618,20 @@ dns_input_query(const struct dns_hdr *hdr, const void *query, size_t len)
 {
     const uint8_t   *p = query;
     const uint8_t   *end = (const uint8_t *)hdr + len;
+    uint8_t         qname[DNS_MAX_QNAME];
+    uint16_t        qtype;
+    uint16_t        qclass;
+
+    /* Parse */
+    if (!(p = dns_decomp_name(hdr, query, qname, len))) return NULL;
+    if ((p + 4) > end) return NULL;
+    qtype = *p++ << 8;
+    qtype |= *p++;
+    qclass = *p++ << 8;
+    qclass |= *p++;
     
-    /*
-     * Get the length of the length of the QNAME, which will be a string of
-     * *stuff* terminted with either a null, or a byte beginning with 0xc0.
-     */
-    while (p < end) {
-        /* end label */
-        if (*p == 0) { p++; break; }
-        /* pointer label */
-        if ((*p & 0xc0) == 0xc0) { p += 2; break; }
-        /* invalid label */
-        if ((*p & 0xc0) != 0x00) return NULL;
-        /* normal label */
-        p += (*p & ~0xc0) + 1;
-    } /* for */
-    /* Skip the QTYPE and QCLASS fields and return the end of the query. */
-    p += 4;
-    return (p < end) ? p : NULL;
+    /* Nothing to do with the queries for now, just ignore them. */
+    return p;
 } /* dns_input_query */
 
 /*FUNCTION:------------------------------------------------------
@@ -325,28 +650,16 @@ dns_input_query(const struct dns_hdr *hdr, const void *query, size_t len)
 const void *
 dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
 {
-    enum {
-        argv_script = 0,
-        argv_dname,
-        argv_ttl,
-        argv_class,
-        argv_type,
-        argv_data,
-        argv_null,
-    };
+    struct dns_cache *cache;
     uint8_t         name[DNS_MAX_STRING];
     const uint8_t   *p = record;
     const uint8_t   *end = (const uint8_t *)hdr + len;
     uint16_t        type, rclass, rlength;
     uint32_t        ttl;
-    /* Script args. */
-    char            strttl[sizeof(uint32_t)*3 + 1];
-    char            data[512];  /* how big is big enough? */
-    const char *    argv[argv_null + 1];
     
     /* Decompress the DNS name. */
     if (!(p = dns_decomp_name(hdr, record, name, len))) return NULL;
-    if ((p + 10) >= end) return NULL; /* record too short */
+    if ((p + 10) > end) return NULL; /* record too short */
         
     /* Parse the type, class, TTL and rdlength, they probably won't be word
      * aligned, so do it byte-by-byte. */
@@ -361,7 +674,7 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
     rlength = *p++ << 8;
     rlength |= *p++;
     /* Update the end pointer for this record. */
-    if ((p + rlength) >= end) return NULL; /* RDATA too long. */
+    if ((p + rlength) > end) return NULL; /* RDATA too long. */
     end = p + rlength;
     
     /* If there were any filters specified, only evaluate matching domains. */
@@ -370,62 +683,80 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
     /* Ignore non-internet class records. */
     if (rclass != DNS_CLASS_IN) return end;
     
-    /* Prepare the script arguments. */
-    memset(argv, 0, sizeof(argv));
-    argv[argv_script] = match_script;
-    argv[argv_dname] = dns_decode_name(name);
-    sprintf(strttl, "%d", ttl);
-    argv[argv_ttl] = strttl;
-    argv[argv_class] = "IN";
-    
+    /* Lookup any matching DNS cache entries with the same name and type. */
+    cache = dns_cache_lookup(type, name);
+    if (!cache) {
+        /* If not found, create one. */
+        cache = calloc(sizeof(struct dns_cache), 1);
+        if (!cache) {
+            fprintf(stderr, "Failed to allocate DNS cache entry\n");
+            return NULL;
+        }
+        cache->nlen = dns_namelen(name);
+        cache->type = type;
+        cache->rclass = rclass;
+        memcpy(cache->name, name, cache->nlen);
+        /*
+         * TODO: Some records could potentially be very large (ie TXT), or there
+         * could be multiple records with the same name (ie: SRV). We should think
+         * of ways to handle them gracefully.
+         */
+    }
     /* Parse the record data. */
     switch (type) {
     case DNS_TYPE_A:{
-        if (rlength < sizeof(struct in_addr)) return NULL; /* malformed A record. */
-        argv[argv_type] = "A";
-        argv[argv_data] = inet_ntop(AF_INET, p, data, sizeof(data));
-        if (!argv[argv_data]) return NULL; /* malformed A record. */
+        if (rlength < sizeof(struct in_addr)) return NULL;
+        cache->length = sizeof(struct in_addr);
+        memcpy(cache->target, p, cache->length);
         break;
     }
     case DNS_TYPE_AAAA:{
-        if (rlength < sizeof(struct in6_addr)) return NULL; /* malformed AAAA record. */
-        argv[argv_type] = "AAAA";
-        argv[argv_data] = inet_ntop(AF_INET6, p, data, sizeof(data));
-        if (!argv[argv_data]) return NULL; /* malformed AAAA record. */
+        if (rlength < sizeof(struct in6_addr)) return NULL;
+        cache->length = sizeof(struct in6_addr);
+        memcpy(cache->target, p, cache->length);
         break;
     }
     case DNS_TYPE_NS:
     case DNS_TYPE_CNAME:
+    case DNS_TYPE_PTR:
+        if (!dns_decomp_name(hdr, p, cache->target, len)) return NULL;
+        cache->length = dns_namelen(cache->target);
+        break;
+    case DNS_TYPE_MX:
+        if (rlength < 2) return NULL;
+        cache->priority = (p[0] << 8) | p[1];   p += 2;
+        if (!dns_decomp_name(hdr, p, cache->target, len)) return NULL;
+        cache->length = dns_namelen(cache->target);
+        break;
+    case DNS_TYPE_SRV:
+        /* Parse the SRV record. */
+        if (rlength < 6) return NULL;
+        cache->priority = (p[0] << 8) | p[1];   p += 2;
+        cache->weight = (p[0] << 8) | p[1];     p += 2;
+        cache->port = (p[0] << 8) | p[1];       p += 2;
+        if (!dns_decomp_name(hdr, p, cache->target, len)) return NULL;
+        cache->length = dns_namelen(cache->target);
+        break;
     case DNS_TYPE_SOA:
     case DNS_TYPE_WKS:
-    case DNS_TYPE_PTR:
     case DNS_TYPE_HINFO:
     case DNS_TYPE_MINFO:
-    case DNS_TYPE_MX:
     case DNS_TYPE_TXT:
-    case DNS_TYPE_SRV:
     default:
         return end;
     } /* switch */
     
-    /* Fork and execute the script. Do not wait for the child. */
-    if (argv[argv_script]) {
-        if (fork() == 0) {
-            /* We are the child - execute the script. */
-            execv(argv[argv_script], argv);
-            /* We should not get here, bad things have happened if we do. */
-            abort();
-        } else {
-            /* We are the parent, wait for the child to complete. */
-            /* Or do we continue? and let the child reap itself when done? */
-            wait(NULL);
-            /* TODO: Don't update the routes if the script returns an erorr. */
-        }
+    /* Update the cache, and invoke the script. */
+    dns_cache_update(cache, ttl);
+    if (match_script) {
+        dns_cache_script(cache, ttl, match_script);
     }
+
     /* If a router and/or interface was specified, update the routing table */
     if (type != DNS_TYPE_A) return end;
     if ((match_route.s_addr != htonl(INADDR_ANY)) || match_ifindex) {
-        int sock;
+        int     sock;
+        uint8_t data[512];
         /*
          * TODO: We need to keep a list of records and manage the TTL so that
          * we're not filling the kernel's table with zombie routes. It would
@@ -524,6 +855,12 @@ usage(int argc, char **argv)
     /* TODO: */
 } /* usage */
 
+/* Signal handling. */
+static sig_atomic_t caught_sigusr = 0;
+static sig_atomic_t caught_sigint = 0;
+static void handle_sigusr(int sig) { caught_sigusr = 1; }
+static void handle_sigint(int sig) { caught_sigint = 1; }
+
 int
 main(int argc, char **argv)
 {
@@ -578,28 +915,7 @@ main(int argc, char **argv)
     
     /* Parse the remaining options (if any) as a list of domains to match. */
     while (optind < argc) {
-        struct filter_list *f, *p; 
-        /* Allocate memory for the filter list entry. */
-        if (!(f = malloc(sizeof(struct filter_list)))) {
-            fprintf(stderr, "Out of memory!\n");
-            return EXIT_FAILURE;
-        }
-        /* Parse the filter domain. */
-        f->next = NULL;
-        f->length = dns_encode_name(argv[optind++], f->domain);
-        if (f->length < 0) {
-            fprintf(stderr, "Malformed DNS domain: %s\n", argv[optind-1]);
-            return EXIT_FAILURE;
-        }
-        /* Insert this domain into the filter list, and keep it sorted by length */
-        if (!filters || (filters->length < f->length)) {
-            f->next = filters;
-            filters = f;
-            continue;
-        }
-        for (p = filters; p->next; p = p->next) if (p->next->length <= f->length) break;
-        f->next = p->next;
-        p->next = f;
+        dns_filter_add(argv[optind++]);
     } /* while */
     
     /* Open a raw socket to sniff on all DNS traffic. */
@@ -609,6 +925,10 @@ main(int argc, char **argv)
         return;
     }
     
+    /* Catch SIGINT for graceful cleanup and SIGUSR to display the cache. */
+    signal(SIGINT, handle_sigint);
+    signal(SIGUSR1, handle_sigusr);
+
     /* Listen for DNS packets.  */
     for (;;) {
         struct sockaddr_storage sas;
@@ -617,14 +937,35 @@ main(int argc, char **argv)
         struct udp_hdr  *udp = (struct udp_hdr *)(ip+1);
         struct dns_hdr  *dns = (struct dns_hdr *)(udp+1);
         int             len, i;
+        fd_set          rfd;
+        struct timeval  tv;
+
         
         /* Receive incoming UDP datagrams. */
+        dns_cache_timeout(&tv, match_script);
+        FD_ZERO(&rfd);
+        FD_SET(sock, &rfd);
+        i = select(sock+1, &rfd, 0, 0, 0);
+        if (i < 0) {
+            if (errno == EAGAIN) continue; /* timeout */
+            if (errno != EINTR) perror("Select failed while waiting for packets:");
+            if (caught_sigint) break; /* cleanup gracefully */
+            if (!caught_sigusr) {
+                /* Unexpected signal */
+                fprintf(stderr, "Caught unexpected signal!\n");
+                break;
+            }
+            caught_sigusr = 0;
+            dns_cache_dump();
+            continue;
+        }
+
+        /* Read the socket for DNS packets. */
         len = recv(sock, buff, sizeof(buff), 0);
         if (len < 0) {
-            if (errno != EINTR) perror("Failed to read from socket:");
+            fprintf(stderr, "Failed to read socket: %s\n", strerror(errno));
             break;
         }
-        
         /* Ignore everything that isn't a DNS response. */
         /* TODO: Should we worry about the checksum, or can we expect the kernel to filter for us? */
         len -= (sizeof(struct ip_hdr) + sizeof(struct udp_hdr));
