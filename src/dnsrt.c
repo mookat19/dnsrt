@@ -146,14 +146,14 @@ dns_encode_name(char *start)
 /* DNS cache of matching records. */
 /*  Stored in a double-linked list.
  *  Sorted by increasing TTL.
- *  TTL is in seconds relative to the CLOCK_MONOTONIC timer.
+ *  TTL is in seconds relative to the CLOCK_REALTIME timer.
  */
 struct dns_cache {
     struct dns_cache *next;
     struct dns_cache *prev;
     uint8_t         nlen;
     uint8_t         name[DNS_MAX_QNAME];
-    unsigned long   ttl;
+    time_t          ttl;
     uint16_t        type;
     uint16_t        rclass;
     uint16_t        priority;   /* SRV/MX records only */
@@ -198,7 +198,7 @@ enum {
  *---------------------------------------------------------------
  */
 static void
-dns_cache_update(struct dns_cache *cache, unsigned long ttl)
+dns_cache_update(struct dns_cache *cache, time_t ttl)
 {
     struct timespec     now;
     struct dns_cache    *p;
@@ -242,12 +242,14 @@ dns_cache_update(struct dns_cache *cache, unsigned long ttl)
  *  PARAMETERS
  *      type                ; Record type.
  *      name                ; Record name.
+ *      target              ; Record target
+ *      length              ; Target length (in bytes).
  *  RETURNS
  *      struct dns_cache *  ;
  *---------------------------------------------------------------
  */
 static struct dns_cache *
-dns_cache_lookup(uint16_t type, const uint8_t *name)
+dns_cache_lookup(uint16_t type, const uint8_t *name, const uint8_t *target, uint16_t length)
 {
     struct dns_cache *p;
     int nlen = dns_namelen(name);
@@ -255,6 +257,9 @@ dns_cache_lookup(uint16_t type, const uint8_t *name)
         if (p->type != type) continue;
         if (p->nlen != nlen) continue;
         if (memcmp(p->name, name, nlen)) continue;
+        /* Also compare the target data. */
+        if (p->length != length) continue;
+        if (memcmp(p->target, target, length)) continue;
         return p;
     } /* for */
     return NULL;
@@ -274,7 +279,7 @@ dns_cache_lookup(uint16_t type, const uint8_t *name)
  *---------------------------------------------------------------
  */
 static void
-dns_cache_do(struct dns_cache *cache, dns_cache_action action, unsigned long now, void *script)
+dns_cache_do(struct dns_cache *cache, dns_cache_action action, time_t now, void *script)
 {
     int  offset = 0;
     char name[DNS_MAX_STRING];
@@ -302,7 +307,7 @@ do {int len = dns_namelen(_target_);            \
     memset(argv, 0, sizeof(argv));
     cache_argv_const(argv, argv_script, script);
     cache_argv_name(argv, argv_name, cache->name);
-    cache_argv_fmt(argv, argv_ttl, "%lu", (cache->ttl) ? (cache->ttl - now) : 0);
+    cache_argv_fmt(argv, argv_ttl, "%llu", (unsigned long long)((cache->ttl > now) ? (cache->ttl - now) : 0));
     cache_argv_const(argv, argv_class, "IN");
 
     argc = argv_type;
@@ -346,7 +351,7 @@ do {int len = dns_namelen(_target_);            \
 } /* dns_cache_do */
 
 static void
-dns_cache_foreach(dns_cache_action action, unsigned long now, void *script)
+dns_cache_foreach(dns_cache_action action, time_t now, void *script)
 {
     struct dns_cache *cache;
     for (cache = dns_cache_head; cache; cache = cache->next) {
@@ -360,8 +365,9 @@ dns_cache_foreach(dns_cache_action action, unsigned long now, void *script)
  *  DESCRIPTION
  *      Action to invoke the user script for the cache entry.
  *  PARAMETERS
- *      cache           ; Cache entry.
- *      script          ; record script to execute.
+ *      cache           ; DNS Cache entry.
+ *      argc            ; Action arg count.
+ *      argv            ; Action arg array.
  *  RETURNS
  *      void            ;
  *---------------------------------------------------------------
@@ -390,7 +396,9 @@ dns_cache_script(struct dns_cache *cache, int argc, char **argv)
  *  DESCRIPTION
  *      Dumps a cache entry to a file stream.
  *  PARAMETERS
- *      fp              ;
+ *      cache           ; DNS Cache entry.
+ *      argc            ; Action arg count.
+ *      argv            ; Action arg array.
  *  RETURNS
  *      void            ;
  *---------------------------------------------------------------
@@ -399,7 +407,6 @@ static void
 dns_cache_fprint(struct dns_cache *cache, int argc, char **argv)
 {
     FILE    *fp = (FILE *)argv[argv_script];
-
     int     i;
     for (i=1; i<argc-1; i++) fprintf(fp, "%s ", argv[i]);
     fprintf(fp, "%s\n", argv[i]);
@@ -419,51 +426,8 @@ dns_cache_fprint(struct dns_cache *cache, int argc, char **argv)
 static void
 dns_cache_tofile(FILE *fp)
 {
-    struct timespec     now;
-    struct timespec     rt;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    clock_gettime(CLOCK_REALTIME, &rt);
-    now.tv_sec -= rt.tv_sec;
-    now.tv_nsec -= rt.tv_nsec;
-    if (now.tv_nsec < 0) {
-        now.tv_sec--;
-        now.tv_nsec += 1000000000;
-    }
-    dns_cache_foreach(dns_cache_fprint, now.tv_sec, fp);
+    dns_cache_foreach(dns_cache_fprint, 0, fp);
 } /* dns_cache_tofile */
-
-/*FUNCTION:------------------------------------------------------
- *  NAME
- *      dns_cache_timeout
- *  DESCRIPTION
- *      Purges expired records from the DNS cache and calculates
- *      the next timeout.
- *  PARAMETERS
- *      tv              ; Timeout until the next cache purge.
- *  RETURNS
- *      int             ; non-zero if there was a change to the cache.
- *---------------------------------------------------------------
- */
-static int
-dns_cache_timeout(struct timeval *tv, char *script)
-{
-    struct timespec now;
-    int change = dns_cache_dirty;
-    if (dns_cache_dirty) dns_cache_dirty = 0;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    while (dns_cache_head) {
-        struct dns_cache *p = dns_cache_head;
-        if (dns_cache_head->ttl > now.tv_sec) break;
-        if (script) dns_cache_do(p, dns_cache_script, now.tv_sec, script);
-        if (p->next) p->next->prev = NULL;
-        dns_cache_head = p->next;
-        free(p);
-        change = 1;
-    } /* while */
-    tv->tv_usec = 0;
-    tv->tv_sec = (dns_cache_head) ? (dns_cache_head->ttl - now.tv_sec) : 60;
-    return change;
-} /* dns_cache_timeout */
 
 /* List of domains to filter (whitelist), sorted by decreasing length. */
 struct filter_list {
@@ -581,6 +545,200 @@ rnl_addattr(struct nlmsghdr *nh, int maxlen, int type, const void *data, int ale
     nh->nlmsg_len = nlen;
     return nlen;
 } /* rnl_addattr */
+
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_cache_routeadd
+ *  DESCRIPTION
+ *      Cache action function to install a routing table entry.
+ *  PARAMETERS
+ *      cache           ; DNS Cache entry.
+ *      argc            ; Action arg count.
+ *      argv            ; Action arg array.
+ *  RETURNS
+ *      void            ;
+ *---------------------------------------------------------------
+ */
+static void
+dns_cache_routeadd(struct dns_cache *cache, int argc, char **argv)
+{
+    if (cache->type == DNS_TYPE_A) {
+        struct in_addr *    gw = (struct in_addr *)argv[0];
+        int                 sock;
+        uint8_t             data[512];
+        struct sockaddr_nl  sa;
+        struct nlmsghdr     *nh = (struct nlmsghdr *)data;
+        struct rtmsg        *rtm = NLMSG_DATA(nh);
+
+        /*
+         * TODO: We need to keep a list of records and manage the TTL so that
+         * we're not filling the kernel's table with zombie routes. It would
+         * be nice if we could set the rta_expires timer from userspace.
+         */
+        memset(nh, 0, NLMSG_SPACE(sizeof(struct rtmsg)));
+        nh->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+        nh->nlmsg_type = RTM_NEWROUTE;
+        nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK;
+        nh->nlmsg_pid = 0;
+        nh->nlmsg_seq = ++match_nlseqno;
+        rtm->rtm_family = AF_INET;
+        rtm->rtm_dst_len = 32;
+        rtm->rtm_protocol = RTPROT_REDIRECT; /* TODO: Will any of these trigger the expires timer? */
+        rtm->rtm_type = RTN_UNICAST; 
+        rtm->rtm_scope = RT_SCOPE_UNIVERSE;
+        rtm->rtm_table = RT_TABLE_UNSPEC;
+        rnl_addattr(nh, sizeof(data), RTA_DST, cache->target, sizeof(struct in_addr));
+        rnl_addattr(nh, sizeof(data), RTA_GATEWAY, gw, sizeof(struct in_addr));
+        
+        /* Send RTM_NEWROUTE to the kernel. */
+        memset(&sa, 0, sizeof(sa));
+        sa.nl_family = AF_NETLINK;
+        sock = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
+        if (sock < 0) return;
+        if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+            fprintf(stderr, "bind failed on netlink socket (%s)\n", strerror(errno));
+            close(sock);
+            return;
+        }
+        sa.nl_pid = 0; /* sending to the kernel. */
+        if (sendto(sock, nh, nh->nlmsg_len, 0, (struct sockaddr *)&sa, sizeof(sa)) != nh->nlmsg_len) {
+            fprintf(stderr, "RTM_NEWROUTE failed (%s)\n", strerror(errno));
+        }
+        close(sock);
+    }
+    /* TODO: IPv6 support. */
+} /* dns_cache_routeadd */
+
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_cache_routedel
+ *  DESCRIPTION
+ *      Cache action function to remove a routing table entry.
+ *  PARAMETERS
+ *      cache           ; DNS Cache entry.
+ *      argc            ; Action arg count.
+ *      argv            ; Action arg array.
+ *  RETURNS
+ *      void            ;
+ *---------------------------------------------------------------
+ */
+static void
+dns_cache_routedel(struct dns_cache *cache, int argc, char **argv)
+{
+    if (cache->type == DNS_TYPE_A) {
+        struct in_addr *    gw = (struct in_addr *)argv[0];
+        int                 sock;
+        uint8_t             data[512];
+        struct sockaddr_nl  sa;
+        struct nlmsghdr     *nh = (struct nlmsghdr *)data;
+        struct rtmsg        *rtm = NLMSG_DATA(nh);
+
+        memset(nh, 0, NLMSG_SPACE(sizeof(struct rtmsg)));
+        nh->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+        nh->nlmsg_type = RTM_DELROUTE;
+        nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+        nh->nlmsg_pid = 0;
+        nh->nlmsg_seq = ++match_nlseqno;
+        rtm->rtm_family = AF_INET;
+        rtm->rtm_dst_len = 32;
+        rtm->rtm_protocol = RTPROT_REDIRECT; /* TODO: Will any of these trigger the expires timer? */
+        rtm->rtm_type = RTN_UNICAST; 
+        rtm->rtm_scope = RT_SCOPE_UNIVERSE;
+        rtm->rtm_table = RT_TABLE_UNSPEC;
+        rnl_addattr(nh, sizeof(data), RTA_DST, cache->target, sizeof(struct in_addr));
+        /* Make sure we only delete entries with the same gateway, to avoid breaking other routes. */
+        rnl_addattr(nh, sizeof(data), RTA_GATEWAY, gw, sizeof(struct in_addr));
+        
+        /* Send RTM_DELROUTE to the kernel. */
+        memset(&sa, 0, sizeof(sa));
+        sa.nl_family = AF_NETLINK;
+        sock = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
+        if (sock < 0) return;
+        if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+            fprintf(stderr, "bind failed on netlink socket (%s)\n", strerror(errno));
+            close(sock);
+            return;
+        }
+        sa.nl_pid = 0; /* sending to the kernel. */
+        if (sendto(sock, nh, nh->nlmsg_len, 0, (struct sockaddr *)&sa, sizeof(sa)) != nh->nlmsg_len) {
+            fprintf(stderr, "RTM_DELROUTE failed (%s)\n", strerror(errno));
+        }
+        close(sock);
+    }
+    /* TODO: IPv6 support. */
+} /* dns_cache_routedel */
+
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_cache_timeout
+ *  DESCRIPTION
+ *      Purges expired records from the DNS cache and calculates
+ *      the next timeout.
+ *  PARAMETERS
+ *      tv              ; Timeout until the next cache purge.
+ *      script          ; User script to execute for expired entries.
+ *  RETURNS
+ *      int             ; non-zero if there was a change to the cache.
+ *---------------------------------------------------------------
+ */
+static int
+dns_cache_timeout(struct timeval *tv, char *script)
+{
+    struct timespec now;
+    int change = dns_cache_dirty;
+    if (dns_cache_dirty) dns_cache_dirty = 0;
+    clock_gettime(CLOCK_REALTIME, &now);
+    while (dns_cache_head) {
+        struct dns_cache *p = dns_cache_head;
+        if (dns_cache_head->ttl > now.tv_sec) break;
+        if (p->type == DNS_TYPE_A && match_route.s_addr != htonl(INADDR_ANY)) {
+            dns_cache_do(p, dns_cache_routedel, now.tv_sec, &match_route);
+        }
+        if (script) {
+            dns_cache_do(p, dns_cache_script, now.tv_sec, script);
+        }
+        if (p->next) p->next->prev = NULL;
+        dns_cache_head = p->next;
+        free(p);
+        change = 1;
+    } /* while */
+    tv->tv_usec = 0;
+    tv->tv_sec = (dns_cache_head) ? (dns_cache_head->ttl - now.tv_sec) : 60;
+    return change;
+} /* dns_cache_timeout */
+
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_cache_flush
+ *  DESCRIPTION
+ *      Cleanup function to remove all cache entries.
+ *  PARAMETERS
+ *      void            ;
+ *  RETURNS
+ *      void            ;
+ *---------------------------------------------------------------
+ */
+static void
+dns_cache_flush(void)
+{
+    struct dns_cache    *p;
+    struct timespec     now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    while ((p = dns_cache_head)) {
+        /* Clear the records. */
+        p->ttl = 0;
+        if (p->type == DNS_TYPE_A && match_route.s_addr != htonl(INADDR_ANY)) {
+            dns_cache_do(p, dns_cache_routedel, now.tv_sec, &match_route);
+        }
+        if (match_script) {
+            dns_cache_do(p, dns_cache_script, now.tv_sec, match_script);
+        }
+        /* TODO IPv6 support */
+        /* Free the cache entry. */
+        dns_cache_head = p->next;
+        free(p);
+    } /* for */
+} /* dns_cache_flush */
 
 /*FUNCTION:------------------------------------------------------
  *  NAME
@@ -715,11 +873,15 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
 {
     struct dns_cache *cache;
     uint8_t         name[DNS_MAX_STRING];
+    uint8_t         target[DNS_MAX_QNAME];
     const uint8_t   *p = record;
     const uint8_t   *end = (const uint8_t *)hdr + len;
     uint16_t        type, rclass, rlength;
     uint32_t        ttl;
     struct timespec now;
+    uint16_t        priority = 0;
+    uint16_t        weight = 0;
+    uint16_t        port = 0;
     
     /* Decompress the DNS name. */
     if (!(p = dns_decomp_name(hdr, record, name, len))) return NULL;
@@ -747,8 +909,52 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
     /* Ignore non-internet class records. */
     if (rclass != DNS_CLASS_IN) return end;
     
-    /* Lookup any matching DNS cache entries with the same name and type. */
-    cache = dns_cache_lookup(type, name);
+    /* Parse the record data. */
+    switch (type) {
+    case DNS_TYPE_A:{
+        if (rlength < sizeof(struct in_addr)) return NULL;
+        rlength = sizeof(struct in_addr);
+        memcpy(target, p, rlength);
+        break;
+    }
+    case DNS_TYPE_AAAA:{
+        if (rlength < sizeof(struct in6_addr)) return NULL;
+        rlength = sizeof(struct in6_addr);
+        memcpy(target, p, rlength);
+        break;
+    }
+    case DNS_TYPE_NS:
+    case DNS_TYPE_CNAME:
+    case DNS_TYPE_PTR:
+        if (!dns_decomp_name(hdr, p, target, len)) return NULL;
+        rlength = dns_namelen(target);
+        break;
+    case DNS_TYPE_MX:
+        if (rlength < 2) return NULL;
+        priority = (p[0] << 8) | p[1];   p += 2;
+        if (!dns_decomp_name(hdr, p, target, len)) return NULL;
+        rlength = dns_namelen(target);
+        break;
+    case DNS_TYPE_SRV:
+        /* Parse the SRV record. */
+        if (rlength < 6) return NULL;
+        priority = (p[0] << 8) | p[1];   p += 2;
+        weight = (p[0] << 8) | p[1];     p += 2;
+        port = (p[0] << 8) | p[1];       p += 2;
+        if (!dns_decomp_name(hdr, p, target, len)) return NULL;
+        rlength = dns_namelen(target);
+        break;
+    case DNS_TYPE_SOA:
+    case DNS_TYPE_WKS:
+    case DNS_TYPE_HINFO:
+    case DNS_TYPE_MINFO:
+    case DNS_TYPE_TXT:
+    default:
+        return end;
+    } /* switch */
+    
+    /* Lookup any matching records in the DNS cache. */
+    cache = dns_cache_lookup(type, name, target, rlength);
     if (!cache) {
         /* If not found, create one. */
         cache = calloc(sizeof(struct dns_cache), 1);
@@ -759,117 +965,28 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
         cache->nlen = dns_namelen(name);
         cache->type = type;
         cache->rclass = rclass;
+        cache->length = rlength;
         memcpy(cache->name, name, cache->nlen);
-        /*
-         * TODO: Some records could potentially be very large (ie TXT), or there
-         * could be multiple records with the same name (ie: SRV). We should think
-         * of ways to handle them gracefully.
-         */
+        memcpy(cache->target, target, rlength);
+        /* TODO: Support uber-huge records like TXT */
     }
-    /* Parse the record data. */
-    switch (type) {
-    case DNS_TYPE_A:{
-        if (rlength < sizeof(struct in_addr)) return NULL;
-        cache->length = sizeof(struct in_addr);
-        memcpy(cache->target, p, cache->length);
-        break;
-    }
-    case DNS_TYPE_AAAA:{
-        if (rlength < sizeof(struct in6_addr)) return NULL;
-        cache->length = sizeof(struct in6_addr);
-        memcpy(cache->target, p, cache->length);
-        break;
-    }
-    case DNS_TYPE_NS:
-    case DNS_TYPE_CNAME:
-    case DNS_TYPE_PTR:
-        if (!dns_decomp_name(hdr, p, cache->target, len)) return NULL;
-        cache->length = dns_namelen(cache->target);
-        break;
-    case DNS_TYPE_MX:
-        if (rlength < 2) return NULL;
-        cache->priority = (p[0] << 8) | p[1];   p += 2;
-        if (!dns_decomp_name(hdr, p, cache->target, len)) return NULL;
-        cache->length = dns_namelen(cache->target);
-        break;
-    case DNS_TYPE_SRV:
-        /* Parse the SRV record. */
-        if (rlength < 6) return NULL;
-        cache->priority = (p[0] << 8) | p[1];   p += 2;
-        cache->weight = (p[0] << 8) | p[1];     p += 2;
-        cache->port = (p[0] << 8) | p[1];       p += 2;
-        if (!dns_decomp_name(hdr, p, cache->target, len)) return NULL;
-        cache->length = dns_namelen(cache->target);
-        break;
-    case DNS_TYPE_SOA:
-    case DNS_TYPE_WKS:
-    case DNS_TYPE_HINFO:
-    case DNS_TYPE_MINFO:
-    case DNS_TYPE_TXT:
-    default:
-        return end;
-    } /* switch */
-    /* Update the TTL. */
+    cache->priority = priority;
+    cache->weight = weight;
+    cache->port = port;
     
     /* Update the cache, and invoke the script. */
-    clock_gettime(CLOCK_MONOTONIC, &now);
+    clock_gettime(CLOCK_REALTIME, &now);
     dns_cache_update(cache, (ttl) ? (now.tv_sec + ttl) : 0);
     if (match_script) {
         dns_cache_do(cache, dns_cache_script, now.tv_sec, match_script);
     }
 
     /* If a router and/or interface was specified, update the routing table */
-    do {
-        int     sock;
-        uint8_t data[512];
-        struct sockaddr_nl  sa;
-        struct nlmsghdr     *nh = (struct nlmsghdr *)data;
-        struct rtmsg        *rtm = NLMSG_DATA(nh);
-
-        if (type != DNS_TYPE_A) break;
-        if ((match_route.s_addr != htonl(INADDR_ANY)) || match_ifindex) break;
-        /*
-         * TODO: We need to keep a list of records and manage the TTL so that
-         * we're not filling the kernel's table with zombie routes. It would
-         * be nice if we could set the rta_expires timer from userspace.
-         */
-        memset(nh, 0, NLMSG_SPACE(sizeof(struct rtmsg)));
-        nh->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
-        nh->nlmsg_type = RTM_NEWROUTE;
-        nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK;
-        nh->nlmsg_pid = 0;
-        nh->nlmsg_seq = ++match_nlseqno;
-        rtm->rtm_family = AF_INET;
-        rtm->rtm_dst_len = 32;
-        rtm->rtm_protocol = RTPROT_REDIRECT; /* TODO: Will any of these trigger the expires timer? */
-        rtm->rtm_type = RTN_UNICAST; 
-        rtm->rtm_scope = RT_SCOPE_UNIVERSE;
-        rtm->rtm_table = RT_TABLE_UNSPEC;
-        rnl_addattr(nh, sizeof(data), RTA_DST, p, sizeof(struct in_addr));
-        if (match_route.s_addr != htonl(INADDR_ANY)) {
-            rnl_addattr(nh, sizeof(data), RTA_GATEWAY, &match_route, sizeof(struct in_addr));
-        }
-        if (match_ifindex > 0) {
-            rnl_addattr(nh, sizeof(data), RTA_OIF, &match_ifindex, sizeof(int32_t));
-        }
-        
-        /* Send RTM_NEWROUTE to the kernel. */
-        memset(&sa, 0, sizeof(sa));
-        sa.nl_family = AF_NETLINK;
-        sock = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
-        if (sock < 0) break;
-        if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-            fprintf(stderr, "bind failed on netlink socket (%s)\n", strerror(errno));
-            close(sock);
-            break;
-        }
-        sa.nl_pid = 0; /* sending to the kernel. */
-        len = sendto(sock, nh, nh->nlmsg_len, 0, (struct sockaddr *)&sa, sizeof(sa));
-        if (len != nh->nlmsg_len) {
-            fprintf(stderr, "RTM_NEWROUTE failed (%s)\n", strerror(errno));
-        }
-        close(sock);
-    } while(0);
+    while (type == DNS_TYPE_A) {
+        if (match_route.s_addr == htonl(INADDR_ANY)) break;
+        dns_cache_do(cache, (ttl) ? dns_cache_routeadd : dns_cache_routedel, now.tv_sec, &match_route);
+        break;
+    } /* while */
 
     /* If the TTL is zero, free it now. */
     if (!cache->ttl) free(cache);
@@ -1001,8 +1118,10 @@ main(int argc, char **argv)
         return;
     }
     
-    /* Catch SIGINT for graceful cleanup and SIGUSR to display the cache. */
+    /* Catch SIGINT and SIGTERM for graceful cleanup. */
     signal(SIGINT, handle_sigint);
+    signal(SIGTERM, handle_sigint);
+    /* Catch SIGUSR to display the cache. */
     signal(SIGUSR1, handle_sigusr);
 
     /* Listen for DNS packets.  */
@@ -1027,7 +1146,8 @@ main(int argc, char **argv)
         }
         FD_ZERO(&rfd);
         FD_SET(sock, &rfd);
-        i = select(sock+1, &rfd, 0, 0, 0);
+        i = select(sock+1, &rfd, 0, 0, &tv);
+        if (i == 0) continue;
         if (i < 0) {
             if (errno == EAGAIN) continue; /* timeout */
             if (errno != EINTR) perror("Select failed while waiting for packets:");
@@ -1056,7 +1176,11 @@ main(int argc, char **argv)
         if (htons(udp->sport) != DNS_UDP_PORT) continue;
         dns_input(dns, len);
     } /* for */
-    
+    fprintf(stderr, "Cleaning up...\n");
+
+    /* Flush the DNS cache and routing table. */
+    dns_cache_flush();
+    if (cachefile) unlink(cachefile);
     close(sock);
     return 0;
 } /* main */

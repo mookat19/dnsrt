@@ -18,7 +18,7 @@ m = Map("dnsrt", translate("DNS Router"),
 		"and updates the routing table with redirects based on domain name " ..
 		"matches."))
 
-s = m:section(TypedSection, "route", translate("DNS Router Configuration"))
+s = m:section(TypedSection, "main", translate("DNS Router Configuration"))
 s.anonymous = true
 s.addremove = false
 
@@ -36,6 +36,11 @@ dn = s:option(DynamicList, "domain", translate("Domain names"),
         translate("List of <abbr title=\"Domain Name System\">DNS</abbr> " ..
                                 "domains to intercept for routing"))
 dn.datatype = "hostname"
-dn.placeholder = "example.org"       
+dn.placeholder = "/example.org/10.1.2.3"       
+
+s2 = m:section(TypedSection, "_dummy", translate("DNS Router Cache"), "")
+s2.addremove = false
+s2.anonymous = true
+s2.template = "dnsrt_cache"
 
 return m
