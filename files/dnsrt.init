@@ -1,0 +1,49 @@
+#!/bin/sh /etc/rc.common
+# Copyright (C) 2014 Owen Kirby <oskirby@gmail.com>
+
+START=95
+SERVICE_DAEMONIZE=1
+SERVICE_WRITE_PID=1
+SERVICE_PID_FILE=/var/run/dnsrt.pid
+PROGRAM=/usr/sbin/dnsrt
+CACHEFILE=/tmp/dnsrt.cache
+
+append_arg() {
+	local cfg="$1"
+	local var="$2"
+	local opt="$3"
+	local def="$4"
+	local val
+
+	config_get val "$cfg" "$var"
+	[ -n "$val" -o -n "$def" ] && append DNSRT_ARGS "$opt ${val:-$def}"
+}
+
+append_str() {
+	local cfg="$1"
+	local var="$2"
+	
+	config_get val "$cfg" "$var"
+	append DNSRT_ARGS "$val"
+}
+
+start_dnsrt() {
+	DNSRT_ARGS="-c $CACHEFILE"
+	
+	local cfg="$1"
+	append_arg "$cfg" router "-r"
+	append_str "$cfg" domain
+	
+	service_start $PROGRAM $DNSRT_ARGS
+}
+
+
+start() {
+	config_load 'dnsrt'
+	config_foreach start_dnsrt 'main'
+}
+
+stop() {
+	service_stop $PROGRAM
+}
+
