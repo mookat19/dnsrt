@@ -164,6 +164,26 @@ struct dns_cache {
 };
 static struct dns_cache *dns_cache_head;
 static struct dns_cache *dns_cache_tail;
+/* Indicates the cache has been modified since the last call to dns_cache_timeout. */
+static int              dns_cache_dirty;
+
+/* Cache entry callback function */
+typedef void (*dns_cache_action)(struct dns_cache *cache, int argc, char **argv);
+
+enum {
+    argv_script = 0,
+    argv_name,
+    argv_ttl,
+    argv_class,
+    argv_type,
+    argv_data,
+    argv_data_1,
+    argv_data_2,
+    argv_data_3,
+    argv_data_4,
+    argv_null,
+    argv_max,
+};
 
 /*FUNCTION:------------------------------------------------------
  *  NAME
@@ -172,13 +192,13 @@ static struct dns_cache *dns_cache_tail;
  *      Updates the TTL and/or inserts an entry into the DNS cache.
  *  PARAMETERS
  *      cache           ; DNS cache entry.
- *      ttl             ; TTL from now.
+ *      ttl             ; New expiration timer.
  *  RETURNS
  *      void            ;
  *---------------------------------------------------------------
  */
 static void
-dns_cache_update(struct dns_cache *cache, uint32_t ttl)
+dns_cache_update(struct dns_cache *cache, unsigned long ttl)
 {
     struct timespec     now;
     struct dns_cache    *p;
@@ -194,9 +214,9 @@ dns_cache_update(struct dns_cache *cache, uint32_t ttl)
     cache->prev = NULL;
     /* Update the TTL, and insert back into the cache. */
     if (!ttl) return;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    cache->ttl = now.tv_sec + ttl;
+    cache->ttl = ttl;
     /* Updated records are more likely to have higher TTL values, so search from the tail. */
+    dns_cache_dirty = 1;
     for (p = dns_cache_tail; p; p = p->prev) {
         if (p->ttl > cache->ttl) continue;
         cache->prev = p;
@@ -254,26 +274,13 @@ dns_cache_lookup(uint16_t type, const uint8_t *name)
  *---------------------------------------------------------------
  */
 static void
-dns_cache_script(struct dns_cache *cache, uint32_t ttl, const char *script)
+dns_cache_do(struct dns_cache *cache, dns_cache_action action, unsigned long now, void *script)
 {
-    enum {
-        argv_script = 0,
-        argv_name,
-        argv_ttl,
-        argv_class,
-        argv_type,
-        argv_data,
-        argv_data_1,
-        argv_data_2,
-        argv_data_3,
-        argv_data_4,
-        argv_null,
-        argv_max,
-    };
-    int         offset = 0;
-    char        name[DNS_MAX_STRING];
-    char        data[512];  /* how big is big enough? */
-    const char *argv[argv_max];
+    int  offset = 0;
+    char name[DNS_MAX_STRING];
+    char data[512];  /* how big is big enough? */
+    int  argc;
+    char *argv[argv_max];
 
 /* Some helper macros. */
 #define cache_argv_fmt(_v_, _idx_, _fmt_, _val_) \
@@ -285,8 +292,7 @@ do {int len = snprintf(data+offset, sizeof(data)-offset, _fmt_, _val_); \
 #define cache_argv_name(_v_, _idx_, _target_)   \
 do {int len = dns_namelen(_target_);            \
     if ((len + offset) >= sizeof(data)) return; \
-    (_v_)[_idx_] = dns_decode_name(memcpy(&data[offset], (_target_), len)); \
-    if (!(_v_)[_idx_]) return;                  \
+    if (!((_v_)[_idx_] = dns_decode_name(memcpy(&data[offset], (_target_), len)))) return; \
     offset += len+1;                            \
 } while(0)
 
@@ -296,50 +302,78 @@ do {int len = dns_namelen(_target_);            \
     memset(argv, 0, sizeof(argv));
     cache_argv_const(argv, argv_script, script);
     cache_argv_name(argv, argv_name, cache->name);
-    cache_argv_fmt(argv, argv_ttl, "%u", ttl);
+    cache_argv_fmt(argv, argv_ttl, "%lu", (cache->ttl) ? (cache->ttl - now) : 0);
     cache_argv_const(argv, argv_class, "IN");
 
+    argc = argv_type;
     switch (cache->type) {
     case DNS_TYPE_A:
-        cache_argv_const(argv, argv_type, "A");
-        argv[argv_data] = inet_ntop(AF_INET, cache->target, &data[offset], sizeof(data)-offset);
-        if (!argv[argv_data]) return; /* malformed. */
+        cache_argv_const(argv, argc++, "A");
+        if (!inet_ntop(AF_INET, cache->target, &data[offset], sizeof(data)-offset)) return;
+        cache_argv_const(argv, argc++, &data[offset]);
         break;
     case DNS_TYPE_AAAA:
         cache_argv_const(argv, argv_type, "AAAA");
-        argv[argv_data] = inet_ntop(AF_INET6, cache->target, &data[offset], sizeof(data)-offset);
-        if (!argv[argv_data]) return; /* malformed. */
+        if (!inet_ntop(AF_INET6, cache->target, &data[offset], sizeof(data)-offset)) return;
+        cache_argv_const(argv, argc++, &data[offset]);
         break;
     case DNS_TYPE_CNAME:
-        cache_argv_const(argv, argv_type, "CNAME");
-        cache_argv_name(argv, argv_data, cache->target);
+        cache_argv_const(argv, argc++, "CNAME");
+        cache_argv_name(argv, argc++, cache->target);
         break;
     case DNS_TYPE_PTR:
-        cache_argv_const(argv, argv_type, "PTR");
-        cache_argv_name(argv, argv_data, cache->target);
+        cache_argv_const(argv, argc++, "PTR");
+        cache_argv_name(argv, argc++, cache->target);
         break;
     case DNS_TYPE_MX:
-        cache_argv_const(argv, argv_type, "MX");
-        cache_argv_fmt(argv, argv_data, "%u", cache->priority);
-        cache_argv_name(argv, argv_data+1, cache->target);
+        cache_argv_const(argv, argc++, "MX");
+        cache_argv_fmt(argv, argc++, "%u", cache->priority);
+        cache_argv_name(argv, argc++, cache->target);
         break;
     case DNS_TYPE_SRV:
-        cache_argv_const(argv, argv_type, "SRV");
-        cache_argv_fmt(argv, argv_data, "%u", cache->priority);
-        cache_argv_fmt(argv, argv_data+1, "%u", cache->weight);
-        cache_argv_fmt(argv, argv_data+2, "%u", cache->port);
-        cache_argv_name(argv, argv_data+3, cache->target);
+        cache_argv_const(argv, argc++, "SRV");
+        cache_argv_fmt(argv, argc++, "%u", cache->priority);
+        cache_argv_fmt(argv, argc++, "%u", cache->weight);
+        cache_argv_fmt(argv, argc++, "%u", cache->port);
+        cache_argv_name(argv, argc++, cache->target);
         break;
     default:
         /* Unsupported record type. */
-        cache_argv_fmt(argv, argv_type, "%u", cache->type);
+        cache_argv_fmt(argv, argc++, "%u", cache->type);
         break;
     } /* switch */
+    action(cache, argc, argv);
+} /* dns_cache_do */
 
+static void
+dns_cache_foreach(dns_cache_action action, unsigned long now, void *script)
+{
+    struct dns_cache *cache;
+    for (cache = dns_cache_head; cache; cache = cache->next) {
+        dns_cache_do(cache, action, now, script);
+    } /* for */
+} /* dns_cache_foreach */
+
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_cache_script
+ *  DESCRIPTION
+ *      Action to invoke the user script for the cache entry.
+ *  PARAMETERS
+ *      cache           ; Cache entry.
+ *      script          ; record script to execute.
+ *  RETURNS
+ *      void            ;
+ *---------------------------------------------------------------
+ */
+static void
+dns_cache_script(struct dns_cache *cache, int argc, char **argv)
+{
     /* Fork and execute the script. Do not wait for the child. */
+    argv[argc] = '\0';
     if (fork() == 0) {
         /* We are the child - execute the script. */
-        execv(argv[argv_script], argv);
+        execv(argv[0], argv);
         /* We should not get here, bad things have happened if we do. */
         abort();
     } else {
@@ -352,26 +386,51 @@ do {int len = dns_namelen(_target_);            \
 
 /*FUNCTION:------------------------------------------------------
  *  NAME
- *      dns_cache_dump
+ *      dns_cache_fprint
  *  DESCRIPTION
- *      Dumps the DNS cache.
+ *      Dumps a cache entry to a file stream.
  *  PARAMETERS
- *      void            ;
+ *      fp              ;
  *  RETURNS
  *      void            ;
  *---------------------------------------------------------------
  */
 static void
-dns_cache_dump(void)
+dns_cache_fprint(struct dns_cache *cache, int argc, char **argv)
 {
-    struct dns_cache    *p;
+    FILE    *fp = (FILE *)argv[argv_script];
+
+    int     i;
+    for (i=1; i<argc-1; i++) fprintf(fp, "%s ", argv[i]);
+    fprintf(fp, "%s\n", argv[i]);
+} /* dns_cache_fprint */
+
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_cache_tofile
+ *  DESCRIPTION
+ *      Dumps the DNS cache to a file stream.
+ *  PARAMETERS
+ *      fp              ;
+ *  RETURNS
+ *      void            ;
+ *---------------------------------------------------------------
+ */
+static void
+dns_cache_tofile(FILE *fp)
+{
     struct timespec     now;
+    struct timespec     rt;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    for (p = dns_cache_head; p; p = p->next) {
-        if (now.tv_sec <= p->ttl)
-            dns_cache_script(p, p->ttl - now.tv_sec, "/bin/echo");
-    } /* for */
-} /* dns_cache_dump */
+    clock_gettime(CLOCK_REALTIME, &rt);
+    now.tv_sec -= rt.tv_sec;
+    now.tv_nsec -= rt.tv_nsec;
+    if (now.tv_nsec < 0) {
+        now.tv_sec--;
+        now.tv_nsec += 1000000000;
+    }
+    dns_cache_foreach(dns_cache_fprint, now.tv_sec, fp);
+} /* dns_cache_tofile */
 
 /*FUNCTION:------------------------------------------------------
  *  NAME
@@ -382,24 +441,28 @@ dns_cache_dump(void)
  *  PARAMETERS
  *      tv              ; Timeout until the next cache purge.
  *  RETURNS
- *      void            ;
+ *      int             ; non-zero if there was a change to the cache.
  *---------------------------------------------------------------
  */
-static void
-dns_cache_timeout(struct timeval *tv, const char *script)
+static int
+dns_cache_timeout(struct timeval *tv, char *script)
 {
-    struct timespec     now;
+    struct timespec now;
+    int change = dns_cache_dirty;
+    if (dns_cache_dirty) dns_cache_dirty = 0;
     clock_gettime(CLOCK_MONOTONIC, &now);
     while (dns_cache_head) {
         struct dns_cache *p = dns_cache_head;
         if (dns_cache_head->ttl > now.tv_sec) break;
-        if (script) dns_cache_script(p, 0, script);
+        if (script) dns_cache_do(p, dns_cache_script, now.tv_sec, script);
         if (p->next) p->next->prev = NULL;
         dns_cache_head = p->next;
         free(p);
+        change = 1;
     } /* while */
     tv->tv_usec = 0;
     tv->tv_sec = (dns_cache_head) ? (dns_cache_head->ttl - now.tv_sec) : 60;
+    return change;
 } /* dns_cache_timeout */
 
 /* List of domains to filter (whitelist), sorted by decreasing length. */
@@ -498,9 +561,9 @@ dns_filter_cmp(const uint8_t *domain)
 
 /* What to do with matching records. */
 static unsigned int match_nlseqno = 0;
-static int32_t match_ifindex = 0;       /* Add a route to A records via this device. */
-static struct in_addr match_route;      /* Add a route to A records via this address. */
-static const char *match_script = NULL; /* Path of script to execute with the record. */
+static int32_t match_ifindex = 0;   /* Add a route to A records via this device. */
+static struct in_addr match_route;  /* Add a route to A records via this address. */
+static char *match_script = NULL;   /* Path of script to execute with the record. */
 
 /* Helper function to append netlink route attributes. */
 #define NLMSG_TAIL(nmsg) ( (void *)((char *)(nmsg) + NLMSG_ALIGN((nmsg)->nlmsg_len)) )
@@ -656,6 +719,7 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
     const uint8_t   *end = (const uint8_t *)hdr + len;
     uint16_t        type, rclass, rlength;
     uint32_t        ttl;
+    struct timespec now;
     
     /* Decompress the DNS name. */
     if (!(p = dns_decomp_name(hdr, record, name, len))) return NULL;
@@ -745,26 +809,30 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
     default:
         return end;
     } /* switch */
+    /* Update the TTL. */
     
     /* Update the cache, and invoke the script. */
-    dns_cache_update(cache, ttl);
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    dns_cache_update(cache, (ttl) ? (now.tv_sec + ttl) : 0);
     if (match_script) {
-        dns_cache_script(cache, ttl, match_script);
+        dns_cache_do(cache, dns_cache_script, now.tv_sec, match_script);
     }
 
     /* If a router and/or interface was specified, update the routing table */
-    if (type != DNS_TYPE_A) return end;
-    if ((match_route.s_addr != htonl(INADDR_ANY)) || match_ifindex) {
+    do {
         int     sock;
         uint8_t data[512];
+        struct sockaddr_nl  sa;
+        struct nlmsghdr     *nh = (struct nlmsghdr *)data;
+        struct rtmsg        *rtm = NLMSG_DATA(nh);
+
+        if (type != DNS_TYPE_A) break;
+        if ((match_route.s_addr != htonl(INADDR_ANY)) || match_ifindex) break;
         /*
          * TODO: We need to keep a list of records and manage the TTL so that
          * we're not filling the kernel's table with zombie routes. It would
          * be nice if we could set the rta_expires timer from userspace.
          */
-        struct sockaddr_nl  sa;
-        struct nlmsghdr     *nh = (struct nlmsghdr *)data;
-        struct rtmsg        *rtm = NLMSG_DATA(nh);
         memset(nh, 0, NLMSG_SPACE(sizeof(struct rtmsg)));
         nh->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
         nh->nlmsg_type = RTM_NEWROUTE;
@@ -789,11 +857,11 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
         memset(&sa, 0, sizeof(sa));
         sa.nl_family = AF_NETLINK;
         sock = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
-        if (sock < 0) return end;
+        if (sock < 0) break;
         if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
             fprintf(stderr, "bind failed on netlink socket (%s)\n", strerror(errno));
             close(sock);
-            return end;
+            break;
         }
         sa.nl_pid = 0; /* sending to the kernel. */
         len = sendto(sock, nh, nh->nlmsg_len, 0, (struct sockaddr *)&sa, sizeof(sa));
@@ -801,7 +869,10 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
             fprintf(stderr, "RTM_NEWROUTE failed (%s)\n", strerror(errno));
         }
         close(sock);
-    }
+    } while(0);
+
+    /* If the TTL is zero, free it now. */
+    if (!cache->ttl) free(cache);
     return end;
 } /* dns_input_record */
 
@@ -864,16 +935,18 @@ static void handle_sigint(int sig) { caught_sigint = 1; }
 int
 main(int argc, char **argv)
 {
-    static const char   *shortopts = "d:r:s:vh";
-    static struct option longopts[] = {
+    const char      *shortopts = "d:r:s:c:vh";
+    struct option   longopts[] = {
         /* Command-line only options. */
         {"dev",     required_argument,  0, 'd'},
         {"route",   required_argument,  0, 'r'},
         {"script",  required_argument,  0, 's'},
+        {"cachefile",required_argument, 0, 'c'},
         {"help",    no_argument,        0, 'h'},
         {"version", no_argument,        0, 'v'},
         {0, 0, 0, 0}
     };
+    const char  *cachefile = NULL;
     int         c;
     int         sock;
     
@@ -903,6 +976,9 @@ main(int argc, char **argv)
                 fprintf(stderr, "Unknown interface: %s\n", optarg);
                 break;
             }
+            continue;
+        case 'c':
+            cachefile = optarg;
             continue;
         default:
         case '?':
@@ -942,7 +1018,13 @@ main(int argc, char **argv)
 
         
         /* Receive incoming UDP datagrams. */
-        dns_cache_timeout(&tv, match_script);
+        if (dns_cache_timeout(&tv, match_script)) {
+            FILE *fp = fopen(cachefile, "w");
+            if (fp) {
+                dns_cache_tofile(fp);
+                fclose(fp);
+            }
+        }
         FD_ZERO(&rfd);
         FD_SET(sock, &rfd);
         i = select(sock+1, &rfd, 0, 0, 0);
@@ -956,7 +1038,7 @@ main(int argc, char **argv)
                 break;
             }
             caught_sigusr = 0;
-            dns_cache_dump();
+            dns_cache_tofile(stdout);
             continue;
         }
 
