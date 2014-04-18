@@ -145,7 +145,7 @@ dns_encode_name(char *start)
 
 /* DNS cache of matching records. */
 /*  Stored in a double-linked list.
- *  Sorted by increasing TTL.
+ *  Sorted by decreasing TTL.
  *  TTL is in seconds relative to the CLOCK_REALTIME timer.
  */
 struct dns_cache {
@@ -212,25 +212,26 @@ dns_cache_update(struct dns_cache *cache, time_t ttl)
     }
     cache->next = NULL;
     cache->prev = NULL;
+
     /* Update the TTL, and insert back into the cache. */
     if (!ttl) return;
     cache->ttl = ttl;
-    /* Updated records are more likely to have higher TTL values, so search from the tail. */
     dns_cache_dirty = 1;
-    for (p = dns_cache_tail; p; p = p->prev) {
+    for (p = dns_cache_head; p; p = p->next) {
         if (p->ttl > cache->ttl) continue;
-        cache->prev = p;
-        cache->next = p->next;
+        cache->next = p;
+        cache->prev = p->prev;
         if (cache->next) cache->next->prev = cache;
         else dns_cache_tail = cache;
         if (cache->prev) cache->prev->next = cache;
         else dns_cache_head = cache;
         return;
     } /* for */
-    cache->prev = NULL;
-    cache->next = dns_cache_head;
-    if (cache->next) cache->next->prev = cache;
-    dns_cache_head = cache;
+    cache->next = NULL;
+    cache->prev = dns_cache_tail;
+    if (cache->prev) cache->prev->next = cache;
+    else dns_cache_head = cache;
+    dns_cache_tail = cache;
 } /* dns_cache_update */
 
 /*FUNCTION:------------------------------------------------------
@@ -318,7 +319,7 @@ do {int len = dns_namelen(_target_);            \
         cache_argv_const(argv, argc++, &data[offset]);
         break;
     case DNS_TYPE_AAAA:
-        cache_argv_const(argv, argv_type, "AAAA");
+        cache_argv_const(argv, argc++, "AAAA");
         if (!inet_ntop(AF_INET6, cache->target, &data[offset], sizeof(data)-offset)) return;
         cache_argv_const(argv, argc++, &data[offset]);
         break;
@@ -350,6 +351,7 @@ do {int len = dns_namelen(_target_);            \
     action(cache, argc, argv);
 } /* dns_cache_do */
 
+/* Invokes the action for each entry in the cache. */
 static void
 dns_cache_foreach(dns_cache_action action, time_t now, void *script)
 {
@@ -688,17 +690,18 @@ dns_cache_timeout(struct timeval *tv, char *script)
     int change = dns_cache_dirty;
     if (dns_cache_dirty) dns_cache_dirty = 0;
     clock_gettime(CLOCK_REALTIME, &now);
-    while (dns_cache_head) {
-        struct dns_cache *p = dns_cache_head;
-        if (dns_cache_head->ttl > now.tv_sec) break;
+    while (dns_cache_tail) {
+        struct dns_cache *p = dns_cache_tail;
+        if (p->ttl > now.tv_sec) break;
         if (p->type == DNS_TYPE_A && match_route.s_addr != htonl(INADDR_ANY)) {
             dns_cache_do(p, dns_cache_routedel, now.tv_sec, &match_route);
         }
         if (script) {
             dns_cache_do(p, dns_cache_script, now.tv_sec, script);
         }
-        if (p->next) p->next->prev = NULL;
-        dns_cache_head = p->next;
+        if (p->prev) p->prev->next = NULL;
+        else dns_cache_head = NULL;
+        dns_cache_tail = p->prev;
         free(p);
         change = 1;
     } /* while */
@@ -724,7 +727,7 @@ dns_cache_flush(void)
     struct dns_cache    *p;
     struct timespec     now;
     clock_gettime(CLOCK_REALTIME, &now);
-    while ((p = dns_cache_head)) {
+    while ((p = dns_cache_tail)) {
         /* Clear the records. */
         p->ttl = 0;
         if (p->type == DNS_TYPE_A && match_route.s_addr != htonl(INADDR_ANY)) {
@@ -735,9 +738,10 @@ dns_cache_flush(void)
         }
         /* TODO IPv6 support */
         /* Free the cache entry. */
-        dns_cache_head = p->next;
+        dns_cache_tail = p->prev;
         free(p);
     } /* for */
+    dns_cache_head = NULL;
 } /* dns_cache_flush */
 
 /*FUNCTION:------------------------------------------------------
