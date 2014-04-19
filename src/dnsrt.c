@@ -684,20 +684,18 @@ dns_cache_routedel(struct dns_cache *cache, int argc, char **argv)
  *---------------------------------------------------------------
  */
 static int
-dns_cache_timeout(struct timeval *tv, char *script)
+dns_cache_timeout(struct timeval *tv, time_t now, char *script)
 {
-    struct timespec now;
     int change = dns_cache_dirty;
     if (dns_cache_dirty) dns_cache_dirty = 0;
-    clock_gettime(CLOCK_REALTIME, &now);
     while (dns_cache_tail) {
         struct dns_cache *p = dns_cache_tail;
-        if (p->ttl > now.tv_sec) break;
+        if (p->ttl > now) break;
         if (p->type == DNS_TYPE_A && match_route.s_addr != htonl(INADDR_ANY)) {
-            dns_cache_do(p, dns_cache_routedel, now.tv_sec, &match_route);
+            dns_cache_do(p, dns_cache_routedel, now, &match_route);
         }
         if (script) {
-            dns_cache_do(p, dns_cache_script, now.tv_sec, script);
+            dns_cache_do(p, dns_cache_script, now, script);
         }
         if (p->prev) p->prev->next = NULL;
         else dns_cache_head = NULL;
@@ -706,7 +704,7 @@ dns_cache_timeout(struct timeval *tv, char *script)
         change = 1;
     } /* while */
     tv->tv_usec = 0;
-    tv->tv_sec = (dns_cache_head) ? (dns_cache_head->ttl - now.tv_sec) : 60;
+    tv->tv_sec = (dns_cache_head) ? (dns_cache_head->ttl - now) : 60;
     return change;
 } /* dns_cache_timeout */
 
@@ -1044,30 +1042,42 @@ dns_input(const struct dns_hdr *hdr, size_t len)
 static void
 usage(int argc, char **argv)
 {
-    /* TODO: */
+    printf("Usage: %s [OPTIONS] [DOMAIN...]\n", argv[0]);
+    printf("Intercept DNS traffic and update the routing table for any A or AAAA records\n");
+    printf("that match the targeted DOMAINS.\n\n");
+    printf("Options:\n");
+    printf("\t-d, --dev IFNAME          Use IFNAME as the outgoing interface for matching records.\n");
+    printf("\t-r, --route ADDR          Use ADDR as the IPv4 gateway for matching records.\n");
+    printf("\t-s, --script FILE         Execute FILE on a DNS cache update for each matching record.\n");
+    printf("\t-c, --cachefile FILE      Preserve the DNS cache in FILE.\n");
+    printf("\t-g, --grace-period DELAY  Maintain the DNS cache entries and routes for matching records\n");
+    printf("\t                          for DELAY seconds beyond the specified TTL.\n");
+    printf("\t-h, --help                Display this message.\n");
+
 } /* usage */
 
 /* Signal handling. */
-static sig_atomic_t caught_sigusr = 0;
-static sig_atomic_t caught_sigint = 0;
-static void handle_sigusr(int sig) { caught_sigusr = 1; }
-static void handle_sigint(int sig) { caught_sigint = 1; }
+static sig_atomic_t caught_sig = 0;
+static void handle_sig(int sig) { caught_sig = sig; }
 
 int
 main(int argc, char **argv)
 {
-    const char      *shortopts = "d:r:s:c:vh";
+    const char      *shortopts = "d:r:s:c:g:vh";
     struct option   longopts[] = {
         /* Command-line only options. */
-        {"dev",     required_argument,  0, 'd'},
-        {"route",   required_argument,  0, 'r'},
-        {"script",  required_argument,  0, 's'},
-        {"cachefile",required_argument, 0, 'c'},
-        {"help",    no_argument,        0, 'h'},
-        {"version", no_argument,        0, 'v'},
+        {"dev",         required_argument, 0, 'd'},
+        {"route",       required_argument, 0, 'r'},
+        {"script",      required_argument, 0, 's'},
+        {"cachefile",   required_argument, 0, 'c'},
+        {"grace-period",required_argument, 0, 'g'},
+        {"help",        no_argument,       0, 'h'},
+        {"version",     no_argument,       0, 'v'},
         {0, 0, 0, 0}
     };
     const char  *cachefile = NULL;
+    char        *end;
+    time_t      graceperiod = 0;
     int         c;
     int         sock;
     
@@ -1101,6 +1111,13 @@ main(int argc, char **argv)
         case 'c':
             cachefile = optarg;
             continue;
+        case 'g':
+            graceperiod = strtoul(optarg, &end, 10);
+            if (*end) {
+                fprintf(stderr, "Invalid parameter: %s\n", optarg);
+                break;
+            }
+            continue;
         default:
         case '?':
             break;
@@ -1109,12 +1126,12 @@ main(int argc, char **argv)
         usage(argc, argv);
         return EXIT_FAILURE;
     } /* while */
-    
-    /* Parse the remaining options (if any) as a list of domains to match. */
-    while (optind < argc) {
-        dns_filter_add(argv[optind++]);
-    } /* while */
-    
+
+    /* Catch SIGINT and SIGTERM for graceful cleanup. */
+    signal(SIGINT, handle_sig);
+    signal(SIGTERM, handle_sig);
+    signal(SIGUSR1, handle_sig);
+
     /* Open a raw socket to sniff on all DNS traffic. */
     sock = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
     if (sock < 0) {
@@ -1122,12 +1139,16 @@ main(int argc, char **argv)
         return;
     }
     
-    /* Catch SIGINT and SIGTERM for graceful cleanup. */
-    signal(SIGINT, handle_sigint);
-    signal(SIGTERM, handle_sigint);
-    /* Catch SIGUSR to display the cache. */
-    signal(SIGUSR1, handle_sigusr);
+    /* TODO: Jump here on SIGHUP */
+    /* TODO: Read config from a file. */
 
+    /* Parse the remaining options (if any) as a list of domains to match. */
+    for (c = optind; c < argc; c++) {
+        dns_filter_add(argv[c]);
+    } /* for */
+    
+    /* TODO: Reload the DNS cache on startup if the cachefile exists. */
+    
     /* Listen for DNS packets.  */
     for (;;) {
         struct sockaddr_storage sas;
@@ -1138,10 +1159,11 @@ main(int argc, char **argv)
         int             len, i;
         fd_set          rfd;
         struct timeval  tv;
-
+        struct timespec now;
         
         /* Receive incoming UDP datagrams. */
-        if (dns_cache_timeout(&tv, match_script)) {
+        clock_gettime(CLOCK_REALTIME, &now);
+        if (dns_cache_timeout(&tv, now.tv_sec - graceperiod, match_script)) {
             FILE *fp = fopen(cachefile, "w");
             if (fp) {
                 dns_cache_tofile(fp);
@@ -1155,13 +1177,20 @@ main(int argc, char **argv)
         if (i < 0) {
             if (errno == EAGAIN) continue; /* timeout */
             if (errno != EINTR) perror("Select failed while waiting for packets:");
-            if (caught_sigint) break; /* cleanup gracefully */
-            if (!caught_sigusr) {
+            if (caught_sig == SIGTERM) {
+                /* Flush the DNS cache before exiting. */
+                fprintf(stderr, "Cleaning up...\n");
+                dns_cache_flush();
+                if (cachefile) unlink(cachefile);
+                break;
+            }
+            if (caught_sig == SIGINT) break; /* Exit without flushing the cache. */
+            if (caught_sig != SIGUSR1) {
                 /* Unexpected signal */
                 fprintf(stderr, "Caught unexpected signal!\n");
                 break;
             }
-            caught_sigusr = 0;
+            caught_sig = 0;
             dns_cache_tofile(stdout);
             continue;
         }
@@ -1180,12 +1209,6 @@ main(int argc, char **argv)
         if (htons(udp->sport) != DNS_UDP_PORT) continue;
         dns_input(dns, len);
     } /* for */
-    fprintf(stderr, "Cleaning up...\n");
-
-    /* Flush the DNS cache and routing table. */
-    dns_cache_flush();
-    if (cachefile) unlink(cachefile);
     close(sock);
     return 0;
 } /* main */
-

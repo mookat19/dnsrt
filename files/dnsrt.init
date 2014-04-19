@@ -32,6 +32,7 @@ start_dnsrt() {
 	
 	local cfg="$1"
 	append_arg "$cfg" router "-r"
+	append_arg "$cfg" graceperiod "-g"
 	append_str "$cfg" domain
 	
 	service_start $PROGRAM $DNSRT_ARGS

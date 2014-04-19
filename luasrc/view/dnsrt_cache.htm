@@ -15,7 +15,7 @@
 
 					if (st[i].ttl <= 0)
 					{
-						timestr = '<em><%:expired%></em>';
+						timestr = String.format('<em>-%t</em>', -st[i].ttl)
 					}
 					else
 					{

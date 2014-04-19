@@ -23,7 +23,7 @@ s.anonymous = true
 s.addremove = false
 
 r = s:option(Value, "router", translate("Router"),
-	translate("Next hop address for intercepted " ..
+	translate("Gateway address for intercepted " ..
 	"<abbr title=\"Domain Name System\">DNS</abbr> records."))
 r.rmempty = false
 r.datatype = "ipaddr"
@@ -31,6 +31,10 @@ r.placeholder = "1.2.3.4"
 
 iface = s:option(ListValue, "interface", translate("Interface"))     
 luci.tools.webadmin.cbi_add_networks(iface)
+
+gp = s:option(Value, "graceperiod", translate("Grace Period"),
+	translate("Length of time in seconds to maintain records beyond their specified TTL."))
+gp.datatype = "uinteger"
 
 dn = s:option(DynamicList, "domain", translate("Domain names"),
         translate("List of <abbr title=\"Domain Name System\">DNS</abbr> " ..
