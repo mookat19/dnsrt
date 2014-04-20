@@ -1,7 +1,7 @@
 all: dnsrt
 
-dnsrouted: dnsrt.c
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+dtsrouted: dnsrt.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -lrt -o $@ $<
 
 clean:
 	rm -f dnsrt

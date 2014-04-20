@@ -151,8 +151,9 @@ dns_encode_name(char *start)
 struct dns_cache {
     struct dns_cache *next;
     struct dns_cache *prev;
-    uint8_t         nlen;
     uint8_t         name[DNS_MAX_QNAME];
+    uint8_t         nlen;
+    int             depth;      /* Level of indirection from a target domain. */
     time_t          ttl;
     uint16_t        type;
     uint16_t        rclass;
@@ -166,6 +167,8 @@ static struct dns_cache *dns_cache_head;
 static struct dns_cache *dns_cache_tail;
 /* Indicates the cache has been modified since the last call to dns_cache_timeout. */
 static int              dns_cache_dirty;
+
+#define DNS_CACHE_DEPTH_LIMIT   4   /* Maximum indirection we'll permit to enter the cache. */
 
 /* Cache entry callback function */
 typedef void (*dns_cache_action)(struct dns_cache *cache, int argc, char **argv);
@@ -265,6 +268,41 @@ dns_cache_lookup(uint16_t type, const uint8_t *name, const uint8_t *target, uint
     } /* for */
     return NULL;
 } /* dns_cache_lookup */
+
+/*FUNCTION:------------------------------------------------------
+ *  NAME
+ *      dns_cache_target
+ *  DESCRIPTION
+ *      Searches for an entry in the DNS cache with the desired
+ *      name and type.
+ *  PARAMETERS
+ *      name                ; Record name.
+ *  RETURNS
+ *      int                 ; Level of indirection from a matching
+ *                              filter entry, or 0 if not a match.
+ *---------------------------------------------------------------
+ */
+static int
+dns_cache_target(const uint8_t *name)
+{
+    struct dns_cache *p;
+    int nlen = dns_namelen(name);
+    for (p = dns_cache_head; p; p = p->next) {
+        switch (p->type) {
+        case DNS_TYPE_NS:
+        case DNS_TYPE_CNAME:
+        case DNS_TYPE_PTR:
+        case DNS_TYPE_MX:
+        case DNS_TYPE_SRV:
+            if (p->length != nlen) continue;
+            if (memcmp(p->target, name, nlen)) continue;
+            return p->depth+1;
+        default:
+            continue;
+        } /* switch */
+    } /* for */
+    return 0;
+} /* dns_cache_target */
 
 /*FUNCTION:------------------------------------------------------
  *  NAME
@@ -723,16 +761,15 @@ static void
 dns_cache_flush(void)
 {
     struct dns_cache    *p;
-    struct timespec     now;
-    clock_gettime(CLOCK_REALTIME, &now);
+    time_t              now = time(0);
     while ((p = dns_cache_tail)) {
         /* Clear the records. */
         p->ttl = 0;
         if (p->type == DNS_TYPE_A && match_route.s_addr != htonl(INADDR_ANY)) {
-            dns_cache_do(p, dns_cache_routedel, now.tv_sec, &match_route);
+            dns_cache_do(p, dns_cache_routedel, now, &match_route);
         }
         if (match_script) {
-            dns_cache_do(p, dns_cache_script, now.tv_sec, match_script);
+            dns_cache_do(p, dns_cache_script, now, match_script);
         }
         /* TODO IPv6 support */
         /* Free the cache entry. */
@@ -880,10 +917,11 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
     const uint8_t   *end = (const uint8_t *)hdr + len;
     uint16_t        type, rclass, rlength;
     uint32_t        ttl;
-    struct timespec now;
     uint16_t        priority = 0;
     uint16_t        weight = 0;
     uint16_t        port = 0;
+    uint8_t         depth;
+    time_t          now;
     
     /* Decompress the DNS name. */
     if (!(p = dns_decomp_name(hdr, record, name, len))) return NULL;
@@ -905,8 +943,10 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
     if ((p + rlength) > end) return NULL; /* RDATA too long. */
     end = p + rlength;
     
-    /* If there were any filters specified, only evaluate matching domains. */
-    if (dns_filter_cmp(name)) return end;
+    /* Check if the record matches any filtered domains. */
+    if (!dns_filter_cmp(name)) depth = 0;
+    /* Otherwise, check if the record is the target of one in the cache. */
+    else if ((depth = dns_cache_target(name)) > DNS_CACHE_DEPTH_LIMIT) return end;
     
     /* Ignore non-internet class records. */
     if (rclass != DNS_CLASS_IN) return end;
@@ -964,6 +1004,7 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
             fprintf(stderr, "Failed to allocate DNS cache entry\n");
             return NULL;
         }
+        cache->depth = depth;
         cache->nlen = dns_namelen(name);
         cache->type = type;
         cache->rclass = rclass;
@@ -977,16 +1018,16 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
     cache->port = port;
     
     /* Update the cache, and invoke the script. */
-    clock_gettime(CLOCK_REALTIME, &now);
-    dns_cache_update(cache, (ttl) ? (now.tv_sec + ttl) : 0);
+    now = time(0);
+    dns_cache_update(cache, (ttl) ? (now + ttl) : 0);
     if (match_script) {
-        dns_cache_do(cache, dns_cache_script, now.tv_sec, match_script);
+        dns_cache_do(cache, dns_cache_script, now, match_script);
     }
 
     /* If a router and/or interface was specified, update the routing table */
     while (type == DNS_TYPE_A) {
         if (match_route.s_addr == htonl(INADDR_ANY)) break;
-        dns_cache_do(cache, (ttl) ? dns_cache_routeadd : dns_cache_routedel, now.tv_sec, &match_route);
+        dns_cache_do(cache, (ttl) ? dns_cache_routeadd : dns_cache_routedel, now, &match_route);
         break;
     } /* while */
 
@@ -1159,11 +1200,9 @@ main(int argc, char **argv)
         int             len, i;
         fd_set          rfd;
         struct timeval  tv;
-        struct timespec now;
         
         /* Receive incoming UDP datagrams. */
-        clock_gettime(CLOCK_REALTIME, &now);
-        if (dns_cache_timeout(&tv, now.tv_sec - graceperiod, match_script)) {
+        if (dns_cache_timeout(&tv, time(0) - graceperiod, match_script)) {
             FILE *fp = fopen(cachefile, "w");
             if (fp) {
                 dns_cache_tofile(fp);
