@@ -946,7 +946,10 @@ dns_input_record(const struct dns_hdr *hdr, const void *record, size_t len)
     /* Check if the record matches any filtered domains. */
     if (!dns_filter_cmp(name)) depth = 0;
     /* Otherwise, check if the record is the target of one in the cache. */
-    else if ((depth = dns_cache_target(name)) > DNS_CACHE_DEPTH_LIMIT) return end;
+    else {
+	depth = dns_cache_target(name);
+        if (!depth || depth > DNS_CACHE_DEPTH_LIMIT) return end;
+    }
     
     /* Ignore non-internet class records. */
     if (rclass != DNS_CLASS_IN) return end;
